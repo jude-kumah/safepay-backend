@@ -3,6 +3,8 @@ import cors from 'cors';
 import http from 'http';
 import { Server } from 'socket.io';
 import * as Engine from './escrowEngine.js';
+import * as Trust from './sellerTrust.js';
+import { verifyRider, samples } from './icolms.js';
 
 const app = express();
 app.use(cors());
@@ -19,7 +21,8 @@ const io = new Server(server, {
 // Single in-memory source of truth. Every connected device (buyer phone,
 // seller phone, bank dashboard) sees the same `state` via the 'state'
 // socket event. Swap this for a real database when you're past the demo.
-let state = Engine.createInitialState();
+const freshState = () => Engine.createInitialState();  // demo marketplace + the base orders
+let state = freshState();
 const presence = new Map(); // socket.id -> { id, role, name }
 const ROLES = ['buyer', 'seller', 'bank'];
 
@@ -35,17 +38,29 @@ app.get('/api/state', (req, res) => res.json(state));
 app.get('/api/presence', (req, res) => res.json(people()));
 app.get('/api/stats', (req, res) => res.json(Engine.computeStats(state)));
 
-// Wraps an engine action: applies it, broadcasts, and returns a clear error
-// message (HTTP 400) instead of silently doing nothing when a move is not
-// allowed, e.g. a wrong PIN.
-function act(fn) {
+// Who is calling? The apps send "Name (role)" in the x-user header.
+const who = (req) => String(req.get('x-user') || 'anonymous').slice(0, 60);
+const isBank = (req) => /\(bank\)\s*$/i.test(who(req));
+const bankOnly = (req) => { if (!isBank(req)) throw new Engine.EngineError('Only the GCB operations console can do this.'); };
+
+// Wraps an engine action: applies it, writes it to the audit trail, broadcasts,
+// and returns a clear error message (HTTP 400) instead of silently doing
+// nothing when a move is not allowed, e.g. a wrong PIN.
+// `fn` may return the new state, or { state, id, target, detail }.
+function act(fn, action, quiet) {
   return (req, res) => {
     try {
       const before = state;
       const out = fn(state, req);
-      state = out.state || out;
+      let next = out.state || out;
+      const id = out.id === undefined ? req.params.id : out.id;
+      if (!quiet) {
+        const o0 = before.orders.find((o) => o.id === id), o1 = next.orders.find((o) => o.id === id);
+        const detail = out.detail || (o0 && o1 && o0.status !== o1.status ? `${o0.status} → ${o1.status}` : '');
+        next = Trust.logAudit(next, { actor: who(req), action: action || req.path, target: out.target || id || '', detail });
+      }
+      state = next;
       broadcast();
-      const id = out.id || req.params.id;
       res.json({ ok: true, state, order: state.orders.find((o) => o.id === id) || null, changed: before !== state });
     } catch (e) {
       if (e instanceof Engine.EngineError) return res.status(400).json({ ok: false, error: e.message });
@@ -57,19 +72,65 @@ function act(fn) {
 
 app.post('/api/orders', act((s, req) => {
   const { item, amt, method, buyer, seller } = req.body || {};
+  Trust.checkOrderLimit(s, seller, amt);          // a seller can only take what their trust level allows
   const next = Engine.createOrder(s, { item, amt, method, buyer, seller: seller || null });
-  return { state: next, id: next.orders[0].id };
-}));
-app.post('/api/orders/:id/send', act((s, req) => Engine.markSent(s, req.params.id, (req.body || {}).by)));
-app.post('/api/orders/:id/confirm', act((s, req) => Engine.confirmDelivery(s, req.params.id)));
-app.post('/api/orders/:id/rider', act((s, req) => Engine.riderDropoff(s, req.params.id)));
-app.post('/api/orders/:id/pin', act((s, req) => Engine.pinConfirm(s, req.params.id, (req.body || {}).pin)));
-app.post('/api/orders/:id/report', act((s, req) => Engine.reportIssue(s, req.params.id, (req.body || {}).reason)));
-app.post('/api/orders/:id/proof', act((s, req) => Engine.submitProof(s, req.params.id, (req.body || {}).proof)));
-app.post('/api/orders/:id/fastforward', act((s, req) => Engine.fastForward(s, req.params.id)));
-app.post('/api/orders/:id/resolve', act((s, req) => Engine.resolveDispute(s, req.params.id, (req.body || {}).outcome)));
+  return { state: next, id: next.orders[0].id, detail: `GH₵ ${next.orders[0].amt}${seller ? ` to ${seller}` : ''}` };
+}, 'order.create'));
+
+// ---- Verified Seller: registry, GCB verification, ratings ----
+app.post('/api/sellers/register', act((s, req) => ({ state: Trust.registerSeller(s, (req.body || {}).name), id: null }), 'seller.register', true));
+app.post('/api/sellers/:name/verification', act((s, req) => ({
+  state: Trust.applyVerification(s, req.params.name, req.body || {}), id: null, target: req.params.name, detail: `Application sent, GH₵ ${Trust.VERIFY_FEE} paid`,
+}), 'verification.apply'));
+app.post('/api/sellers/:name/review', act((s, req) => {
+  bankOnly(req);
+  const { decision, note } = req.body || {};
+  return { state: Trust.reviewVerification(s, req.params.name, decision, note, who(req)), id: null, target: req.params.name, detail: `${decision}${note ? `: ${String(note).slice(0, 80)}` : ''}` };
+}, 'verification.review'));
+app.post('/api/orders/:id/rate', act((s, req) => {
+  const b = req.body || {};
+  return { state: Trust.rateOrder(s, req.params.id, b, b.by), detail: `${b.stars} stars` };
+}, 'order.rate'));
+
+// ---- iCOLMS-GH rider verification (simulation, OPTIONAL) ----
+// SafePay works fully without it (the pitch's pilot runs on the delivery PIN alone).
+// Set ICOLMS_ENABLED=false on the server to switch it off; the apps then hide it.
+const ICOLMS_ENABLED = process.env.ICOLMS_ENABLED !== 'false';
+const needIcolms = (req, res, next) => (ICOLMS_ENABLED ? next() : res.status(503).json({ ok: false, error: 'Rider verification (iCOLMS-GH) is not enabled.' }));
+app.get('/api/config', (req, res) => res.json({ icolms: ICOLMS_ENABLED }));
+// Every lookup is remembered so the bank can see who checked which rider, and
+// when. This list is the seed of the audit trail.
+const lookups = [];
+function recordLookup(req, result) {
+  lookups.unshift({
+    at: result.checkedAt, query: result.query, found: result.found, verified: result.verified,
+    rider: result.rider ? result.rider.fullName : null,
+    by: String(req.get('x-user') || 'anonymous').slice(0, 40),
+  });
+  if (lookups.length > 200) lookups.pop();
+}
+app.get('/api/icolms/samples', needIcolms, (req, res) => res.json({ samples: samples() }));
+app.get('/api/icolms/lookups', needIcolms, (req, res) => res.json({ lookups }));
+app.get('/api/icolms/riders/:id', needIcolms, (req, res) => {
+  const result = verifyRider(req.params.id);
+  recordLookup(req, result);
+  res.json(result);
+});
+app.post('/api/orders/:id/assign-rider', needIcolms, act((s, req) => {
+  const result = verifyRider((req.body || {}).riderId);
+  recordLookup(req, result);
+  return Engine.assignRider(s, req.params.id, result);
+}, 'order.assign_rider'));
+app.post('/api/orders/:id/send', act((s, req) => Engine.markSent(s, req.params.id, (req.body || {}).by), 'order.send'));
+app.post('/api/orders/:id/confirm', act((s, req) => Engine.confirmDelivery(s, req.params.id), 'order.confirm'));
+app.post('/api/orders/:id/rider', act((s, req) => Engine.riderDropoff(s, req.params.id), 'order.rider_dropoff'));
+app.post('/api/orders/:id/pin', act((s, req) => Engine.pinConfirm(s, req.params.id, (req.body || {}).pin), 'order.pin_confirm'));
+app.post('/api/orders/:id/report', act((s, req) => Engine.reportIssue(s, req.params.id, (req.body || {}).reason), 'order.dispute_open'));
+app.post('/api/orders/:id/proof', act((s, req) => Engine.submitProof(s, req.params.id, (req.body || {}).proof), 'order.dispute_proof'));
+app.post('/api/orders/:id/fastforward', act((s, req) => Engine.fastForward(s, req.params.id), 'order.fastforward'));
+app.post('/api/orders/:id/resolve', act((s, req) => Engine.resolveDispute(s, req.params.id, (req.body || {}).outcome), 'order.dispute_resolve'));
 app.post('/api/reset', (req, res) => {
-  state = Engine.createInitialState();
+  state = freshState();
   broadcast();
   res.json({ ok: true, state });
 });

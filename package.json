@@ -4,7 +4,11 @@
   "type": "module",
   "main": "server.js",
   "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" },
+   "scripts": {
+    "start": "node server.js",
+    "sync": "node sync.js",
+    "test": "node test.js && node trust.test.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
